@@ -3,6 +3,7 @@
 # DDNS 一体化脚本（单文件）
 #   换 IP + Cloudflare 域名解析更新 + Telegram 通知（可选）
 #   兼容 BOILCLOUD ippanel API（getIP / changeIP）和自定义换 IP 链接
+#   支持 TG 机器人远程控制: /update /change /status（daemon 运行时生效）
 #
 # 快速开始（从 GitHub 拉取后直接执行）:
 #   chmod +x ddns.sh
@@ -110,6 +111,97 @@ notify_tg() {
         [[ -z "${TG_CHAT_ID:-}" ]] && return 0
         tg_send_to "$TG_CHAT_ID" "$1" &
     fi
+}
+
+# ---------------- TG 机器人命令（远程控制） ----------------
+# 防止手动命令和定时任务同时换 IP：加文件锁串行执行
+with_lock() {
+    if command -v flock >/dev/null 2>&1; then
+        ( flock -x -w 600 200 || exit 1; "$@" ) 200>"$STATE_DIR/run.lock"
+    else
+        "$@"
+    fi
+}
+
+tg_is_admin() { # tg_is_admin <chat_id>
+    local id a arr
+    IFS=',' read -ra arr <<< "${TG_ADMIN_IDS:-}"
+    for a in "${arr[@]}"; do
+        [[ "$(echo "$a" | tr -d ' ')" == "$1" ]] && return 0
+    done
+    return 1
+}
+
+tg_handle_command() { # tg_handle_command <chat_id> <text>
+    local cid="$1" text="$2" cmd ip mode_desc
+    # 取第一个词并去掉 @机器人名 后缀（群里发 /change@xxx_bot 也能识别）
+    cmd=$(echo "$text" | awk '{print $1}' | cut -d@ -f1)
+    case "$cmd" in
+        /update)
+            tg_send_to "$cid" "🔃 收到，正在同步当前 IP 到 DNS..."
+            with_lock do_update >/dev/null 2>&1 &
+            ;;
+        /change)
+            tg_send_to "$cid" "🔄 收到，开始换 IP 并更新解析，完成后会推送结果..."
+            with_lock do_change_ip >/dev/null 2>&1 &
+            ;;
+        /status|/ip)
+            ip=$(get_public_ip) || ip="获取失败"
+            [[ "${MODE:-}" == "interval" ]] && mode_desc="固定间隔，每 ${RUN_INTERVAL}s" || mode_desc="每天 ${DAILY_TIME}"
+            tg_send_to "$cid" "📊 <b>当前状态</b>
+域名: <code>${CF_RECORD_NAME}</code>
+当前 IP: <code>${ip}</code>
+换 IP 模式: ${mode_desc}"
+            ;;
+        /help|/start)
+            tg_send_to "$cid" "🤖 可用命令:
+/update - 同步当前 IP 到 DNS
+/change - 立即换 IP 并更新解析
+/status - 查看当前 IP 和运行模式"
+            ;;
+    esac
+}
+
+# 长轮询监听机器人收到的消息（由 daemon 在后台启动）
+tg_listener() {
+    local offset=0 resp upd uid cid ctype text
+    log "TG 命令监听已启动（/update /change /status）"
+    while true; do
+        resp=$(curl -s --connect-timeout 5 --max-time 35 \
+            "$(tg_api_base)/getUpdates?timeout=25&offset=${offset}" 2>/dev/null)
+        [[ -z "$resp" ]] && { sleep 3; continue; }
+        while IFS= read -r upd; do
+            uid=$(echo "$upd" | jq -r '.update_id // empty')
+            [[ -z "$uid" ]] && continue
+            offset=$((uid + 1))
+            cid=$(echo "$upd" | jq -r '.message.chat.id // empty')
+            ctype=$(echo "$upd" | jq -r '.message.chat.type // empty')
+            text=$(echo "$upd" | jq -r '.message.text // empty')
+            [[ -z "$cid" ]] && continue
+
+            # 广播模式：任何私聊过机器人的用户自动加入订阅者
+            if [[ "${TG_PUSH_MODE:-chat}" == "broadcast" && "$ctype" == "private" ]]; then
+                mkdir -p "$(dirname "$TG_SUBSCRIBERS_FILE")"
+                grep -qx "$cid" "$TG_SUBSCRIBERS_FILE" 2>/dev/null || {
+                    echo "$cid" >> "$TG_SUBSCRIBERS_FILE"
+                    log "TG 新订阅者: $cid"
+                }
+            fi
+
+            [[ "$text" == /* ]] || continue
+            if tg_is_admin "$cid"; then
+                tg_handle_command "$cid" "$text"
+            elif [[ "$text" == "/start"* ]]; then
+                if [[ "${TG_PUSH_MODE:-chat}" == "broadcast" ]]; then
+                    tg_send_to "$cid" "✅ 已订阅 DDNS 通知"
+                else
+                    tg_send_to "$cid" "⛔ 无权限"
+                fi
+            else
+                tg_send_to "$cid" "⛔ 无权限执行命令"
+            fi
+        done < <(echo "$resp" | jq -c '.result[]?' 2>/dev/null)
+    done
 }
 
 # ---------------- 获取公网 IPv4 ----------------
@@ -318,13 +410,19 @@ seconds_until_daily() {
 
 do_daemon() {
     log "守护进程启动，模式: ${MODE}"
-    do_update || true
+
+    # 配置了 TG 机器人就启动命令监听（远程控制 + 广播模式自动收集订阅者）
+    if [[ -n "${TG_BOT_TOKEN:-}" ]]; then
+        tg_listener &
+    fi
+
+    with_lock do_update || true
 
     if [[ "$MODE" == "interval" ]]; then
         log "每 ${RUN_INTERVAL}s 换一次 IP"
         while true; do
             sleep "$RUN_INTERVAL"
-            do_change_ip || true
+            with_lock do_change_ip || true
         done
     elif [[ "$MODE" == "daily" ]]; then
         date -d "today ${DAILY_TIME}" +%s >/dev/null 2>&1 || die "DAILY_TIME 格式错误: $DAILY_TIME（应为 HH:MM）"
@@ -334,7 +432,7 @@ do_daemon() {
             wait_sec=$(seconds_until_daily)
             log "下次换 IP 时间: $(date -d "+${wait_sec} seconds" '+%Y-%m-%d %H:%M:%S')（${wait_sec}s 后）"
             sleep "$wait_sec"
-            do_change_ip || true
+            with_lock do_change_ip || true
         done
     else
         die "MODE 配置错误: $MODE（只能是 interval 或 daily）"
@@ -442,9 +540,9 @@ setup_wizard() {
 
     # ----- Telegram -----
     echo "【4/5】Telegram 通知（可选，直接回车跳过）"
-    local tg_token tg_chat tg_host tg_push_mode
+    local tg_token tg_chat tg_host tg_push_mode tg_admin_ids
     ask "Bot Token（@BotFather 获取，留空跳过）" ""; tg_token="$REPLY"
-    tg_chat="" tg_host="https://api.telegram.org" tg_push_mode="chat"
+    tg_chat="" tg_host="https://api.telegram.org" tg_push_mode="chat" tg_admin_ids=""
     if [[ -n "$tg_token" ]]; then
         ask "TG API 地址（无法直连 TG 时填反代地址）" "https://api.telegram.org"; tg_host="$REPLY"
         echo "  推送方式:"
@@ -468,6 +566,9 @@ setup_wizard() {
                 --data-urlencode "chat_id=${tg_chat}" \
                 --data-urlencode "text=✅ DDNS 脚本通知测试成功" >/dev/null 2>&1 \
                 && echo "已发送，请检查 TG 是否收到" || echo "发送失败，请检查 Token/ChatID/网络"
+            echo "  远程控制: 在 TG 里给机器人发 /update /change /status 可远程操作"
+            ask "允许发命令的 Chat ID（多个用英文逗号分隔，留空禁用远程控制）" "$tg_chat"
+            tg_admin_ids="$REPLY"
         else
             echo "  提示: 让需要接收通知的用户先给机器人发一条消息（如 /start），"
             echo "        脚本每次推送前会自动收集新订阅者并保存到 $TG_SUBSCRIBERS_FILE"
@@ -487,6 +588,9 @@ setup_wizard() {
                 echo "暂无订阅者"
                 echo "  现在可以去给机器人发条消息，之后脚本推送时会自动收集到"
             fi
+            echo "  远程控制: 管理员可在 TG 里给机器人发 /update /change /status 远程操作"
+            ask "管理员 Chat ID（多个用英文逗号分隔，留空禁用远程控制）" ""
+            tg_admin_ids="$REPLY"
         fi
     fi
     echo
@@ -514,6 +618,8 @@ TG_BOT_TOKEN="${tg_token}"
 # 推送模式: chat=指定 Chat ID（群组或个人）; broadcast=所有和机器人私聊过的用户
 TG_PUSH_MODE="${tg_push_mode}"
 TG_CHAT_ID="${tg_chat}"
+# 允许通过 TG 发命令远程控制的 Chat ID（多个用英文逗号分隔，留空禁用）
+TG_ADMIN_IDS="${tg_admin_ids}"
 TG_API_HOST="${tg_host}"
 
 IP_CHECK_INTERVAL=2

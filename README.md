@@ -72,8 +72,25 @@ systemctl restart ddns     # 改完配置后重启生效
 **方式二：广播给所有和机器人私聊过的用户**
 
 - 想接收通知的人只需给机器人发一条消息（如 `/start`）即自动订阅
-- 脚本每次推送前会通过 `getUpdates` 自动收集新订阅者，持久化保存在 `/etc/ddns/tg_subscribers`
-- 用 `ddns.sh tg-subs` 可手动刷新/查看订阅者；要移除某人，直接编辑该文件删掉对应行
+- 订阅者持久化保存在 `/etc/ddns/tg_subscribers`；服务运行时实时收集，也可用 `ddns.sh tg-subs` 手动刷新/查看；要移除某人，直接编辑该文件删掉对应行
 - 注意：该机器人不能同时设置 webhook，否则 `getUpdates` 收不到消息
 
 服务器无法直连 Telegram 时，向导里可以填自己的反代地址。
+
+## TG 机器人远程控制
+
+服务（daemon）运行时，配置里 `TG_ADMIN_IDS` 中的用户可以直接在 TG 里给机器人发命令：
+
+| 命令 | 作用 |
+|------|------|
+| `/update` | 立即把当前公网 IP 同步到 DNS |
+| `/change` | 立即换 IP 并更新解析，完成后推送结果 |
+| `/status` | 查看当前 IP、域名和换 IP 模式 |
+| `/help` | 显示命令列表 |
+
+说明：
+
+- 管理员 Chat ID 在向导里设置（`chat` 模式默认就是推送的 Chat ID），多个用英文逗号分隔；留空则禁用远程控制
+- 非管理员发命令会被拒绝；群里发 `/change@你的机器人` 这种带后缀的写法也能识别
+- 手动命令和定时任务之间有文件锁，不会同时换 IP 打架
+- 旧版本升级上来的用户：配置文件里没有 `TG_ADMIN_IDS`，重新跑一遍 `sudo ddns.sh config`，或手动在 `/etc/ddns/ddns.conf` 里加一行 `TG_ADMIN_IDS="你的ChatID"` 后重启服务
