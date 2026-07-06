@@ -239,15 +239,20 @@ get_public_ip() {
 
 # ---------------- 触发换 IP ----------------
 # 返回 0 表示已触发；返回 1 表示接口明确报错（不再等待新 IP）
+# 成功时从响应中解析剩余次数/下次可换时间，存入 CHANGE_EXTRA 供通知使用
+CHANGE_EXTRA=""
 call_change_ip() {
-    local resp http_code body err
+    local resp http_code body err ok msg uses_left next_ts next_time
+    CHANGE_EXTRA=""
     if [[ "${IP_API_TYPE:-custom}" == "boil" ]]; then
         resp=$(curl -s --connect-timeout 5 --max-time 30 -w '\n%{http_code}' -X POST \
             -H "Authorization: Bearer ${BOIL_TOKEN}" \
             "${BOIL_API}/changeIP/" 2>/dev/null)
         http_code=$(echo "$resp" | tail -n1)
         body=$(echo "$resp" | sed '$d')
-        if [[ "$http_code" != "200" ]]; then
+        ok=$(echo "$body" | jq -r '.ok // empty' 2>/dev/null)
+        # 错误响应: HTTP 400/405 + {"error": "..."}（以防万一，200 但 ok!=true 也按错误处理）
+        if [[ "$http_code" != "200" || ( -n "$ok" && "$ok" != "true" ) ]]; then
             err=$(echo "$body" | jq -r '.error // empty' 2>/dev/null)
             [[ -z "$err" ]] && err="HTTP $http_code: $body"
             log "换 IP 接口返回错误: $err"
@@ -256,7 +261,18 @@ call_change_ip() {
 错误: ${err}"
             return 1
         fi
-        log "换 IP 接口调用成功: $(echo "$body" | tr -d '\n' | head -c 200)"
+        # 成功响应: {"ok":true, "message":"...", "uses_left":N, "next_allowed_at":时间戳}
+        msg=$(echo "$body" | jq -r '.message // empty' 2>/dev/null)
+        uses_left=$(echo "$body" | jq -r '.uses_left // empty' 2>/dev/null)
+        next_ts=$(echo "$body" | jq -r '.next_allowed_at // empty' 2>/dev/null)
+        log "换 IP 接口调用成功: ${msg:-ok}${uses_left:+，今日剩余 ${uses_left} 次}"
+        [[ -n "$uses_left" ]] && CHANGE_EXTRA="
+今日剩余次数: ${uses_left}"
+        if [[ "$next_ts" =~ ^[0-9]+$ ]]; then
+            next_time=$(date -d "@${next_ts}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
+            [[ -n "$next_time" ]] && CHANGE_EXTRA="${CHANGE_EXTRA}
+下次可换时间: ${next_time}"
+        fi
     else
         curl "${CURL_OPTS[@]}" "${CUSTOM_CHANGE_URL}" >/dev/null 2>&1
         log "自定义换 IP 链接已调用"
@@ -391,7 +407,7 @@ IP 仍为: <code>${old_ip}</code>"
 域名: <code>${CF_RECORD_NAME}</code>
 旧 IP: <code>${old_ip}</code>
 新 IP: <code>${new_ip}</code>
-总耗时: ${cost}s"
+总耗时: ${cost}s${CHANGE_EXTRA}"
     else
         notify_tg "❌ <b>换 IP 后 DNS 更新失败</b>
 域名: <code>${CF_RECORD_NAME}</code>
