@@ -160,7 +160,7 @@ call_change_ip() {
             [[ -z "$err" ]] && err="HTTP $http_code: $body"
             log "换 IP 接口返回错误: $err"
             notify_tg "⚠️ <b>换 IP 接口报错</b>
-域名: ${CF_RECORD_NAME}
+域名: <code>${CF_RECORD_NAME}</code>
 错误: ${err}"
             return 1
         fi
@@ -255,11 +255,11 @@ do_update() {
     log "当前公网 IP: $ip"
     if update_dns "$ip"; then
         notify_tg "✅ <b>DDNS 同步完成</b>
-域名: ${CF_RECORD_NAME}
+域名: <code>${CF_RECORD_NAME}</code>
 IP: <code>${ip}</code>"
     else
         notify_tg "❌ <b>DDNS 更新失败</b>
-域名: ${CF_RECORD_NAME}
+域名: <code>${CF_RECORD_NAME}</code>
 IP: <code>${ip}</code>"
         return 1
     fi
@@ -283,7 +283,7 @@ do_change_ip() {
         if (( elapsed >= ${IP_CHANGE_TIMEOUT:-120} )); then
             log "等待新 IP 超时（${IP_CHANGE_TIMEOUT:-120}s），IP 未变化"
             notify_tg "⚠️ <b>换 IP 超时</b>
-域名: ${CF_RECORD_NAME}
+域名: <code>${CF_RECORD_NAME}</code>
 IP 仍为: <code>${old_ip}</code>"
             return 1
         fi
@@ -296,13 +296,13 @@ IP 仍为: <code>${old_ip}</code>"
         cost=$(( (t1 - t0) / 1000 ))
         log "完成：换 IP + 更新解析总耗时 ${cost}s"
         notify_tg "🔄 <b>IP 已更换</b>
-域名: ${CF_RECORD_NAME}
+域名: <code>${CF_RECORD_NAME}</code>
 旧 IP: <code>${old_ip}</code>
 新 IP: <code>${new_ip}</code>
 总耗时: ${cost}s"
     else
         notify_tg "❌ <b>换 IP 后 DNS 更新失败</b>
-域名: ${CF_RECORD_NAME}
+域名: <code>${CF_RECORD_NAME}</code>
 新 IP: <code>${new_ip}</code>，请手动处理"
         return 1
     fi
