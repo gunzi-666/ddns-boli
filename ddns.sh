@@ -77,11 +77,19 @@ TG_SUBSCRIBERS_FILE="/etc/ddns/tg_subscribers"
 
 tg_api_base() { echo "${TG_API_HOST:-https://api.telegram.org}/bot${TG_BOT_TOKEN}"; }
 
-tg_send_to() { # tg_send_to <chat_id> <text>
-    curl "${CURL_OPTS[@]}" -X POST "$(tg_api_base)/sendMessage" \
-        --data-urlencode "chat_id=$1" \
-        --data-urlencode "text=$2" \
-        --data-urlencode "parse_mode=HTML" >/dev/null 2>&1
+tg_send_to() { # tg_send_to <chat_id> <text>  失败自动重试一次，仍失败则记录日志
+    local resp ok try
+    for try in 1 2; do
+        resp=$(curl "${CURL_OPTS[@]}" -X POST "$(tg_api_base)/sendMessage" \
+            --data-urlencode "chat_id=$1" \
+            --data-urlencode "text=$2" \
+            --data-urlencode "parse_mode=HTML" 2>/dev/null)
+        ok=$(echo "$resp" | jq -r '.ok // empty' 2>/dev/null)
+        [[ "$ok" == "true" ]] && return 0
+        [[ "$try" == "1" ]] && sleep 3
+    done
+    log "TG 消息发送失败(chat_id=$1): $(echo "$resp" | jq -r '.description // "网络不通或无响应"' 2>/dev/null | head -c 200)"
+    return 1
 }
 
 # 通过 getUpdates 收集私聊过机器人的用户，合并进订阅者文件（TG 只保留 24h 更新，故需持久化）
